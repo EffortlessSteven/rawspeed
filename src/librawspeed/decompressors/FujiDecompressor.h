@@ -45,6 +45,12 @@ public:
 
     explicit FujiHeader(ByteStream& input_);
     explicit RAWSPEED_READONLY operator bool() const; // validity check
+    [[nodiscard]] bool RAWSPEED_READONLY isLossless() const {
+      return version == 1;
+    }
+    [[nodiscard]] bool RAWSPEED_READONLY isLossy() const {
+      return version == 0;
+    }
 
     uint16_t signature;
     uint8_t version;

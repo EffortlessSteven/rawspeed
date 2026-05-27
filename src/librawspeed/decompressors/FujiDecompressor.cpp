@@ -856,6 +856,9 @@ FujiDecompressor::FujiDecompressor(RawImage img, ByteStream input_)
   if (mRaw->dim != iPoint2D(header.raw_width, header.raw_height))
     ThrowRDE("RAF header specifies different dimensions!");
 
+  if (header.isLossy())
+    ThrowRDE("unsupported Fujifilm lossy compressed RAF");
+
   if (12 == header.raw_bits) {
     ThrowRDE("Aha, finally, a 12-bit compressed RAF! Please consider providing "
              "samples on <https://raw.pixls.us/>, thanks!");
@@ -920,8 +923,8 @@ FujiDecompressor::FujiHeader::FujiHeader(ByteStream& bs)
 FujiDecompressor::FujiHeader::operator bool() const {
   // general validation
   const bool invalid =
-      (signature != 0x4953 || version != 1 || raw_height > 0x3000 ||
-       raw_height < FujiStrip::lineHeight() ||
+      (signature != 0x4953 || (!isLossless() && !isLossy()) ||
+       raw_height > 0x3000 || raw_height < FujiStrip::lineHeight() ||
        raw_height % FujiStrip::lineHeight() || raw_width > 0x3000 ||
        raw_width < 0x300 || raw_width % 24 || raw_rounded_width > 0x3000 ||
        block_size != 0x300 || raw_rounded_width < block_size ||
