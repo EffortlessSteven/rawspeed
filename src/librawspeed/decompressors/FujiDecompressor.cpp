@@ -27,6 +27,7 @@
 #include "adt/Array1DRef.h"
 #include "adt/Array2DRef.h"
 #include "adt/Casts.h"
+#include "adt/CroppedArray1DRef.h"
 #include "adt/CroppedArray2DRef.h"
 #include "adt/Invariant.h"
 #include "adt/Optional.h"
@@ -856,10 +857,7 @@ FujiDecompressor::FujiDecompressor(RawImage img, ByteStream input_)
   if (mRaw->dim != iPoint2D(header.raw_width, header.raw_height))
     ThrowRDE("RAF header specifies different dimensions!");
 
-  if (header.isLossy())
-    ThrowRDE("unsupported Fujifilm lossy compressed RAF");
-
-  if (12 == header.raw_bits) {
+  if (header.isLossless() && 12 == header.raw_bits) {
     ThrowRDE("Aha, finally, a 12-bit compressed RAF! Please consider providing "
              "samples on <https://raw.pixls.us/>, thanks!");
   }
@@ -895,6 +893,21 @@ FujiDecompressor::FujiDecompressor(RawImage img, ByteStream input_)
     input.skipBytes(padding);
   }
 
+  if (header.isLossy()) {
+    const int qbaseStride = implicit_cast<int>(roundUp(header.total_lines, 16));
+    const Buffer::size_type qbaseBytes =
+        implicit_cast<Buffer::size_type>(header.blocks_in_row) *
+        implicit_cast<Buffer::size_type>(qbaseStride);
+    const auto qbaseAll = input.getStream(qbaseBytes).getAsArray1DRef();
+
+    qbaseStrips.reserve(header.blocks_in_row);
+    for (int strip = 0; strip != header.blocks_in_row; ++strip) {
+      qbaseStrips.emplace_back(
+          qbaseAll.getCrop(strip * qbaseStride, header.total_lines)
+              .getAsArray1DRef());
+    }
+  }
+
   // calculating raw block offsets
   strips.reserve(header.blocks_in_row);
 
@@ -903,6 +916,9 @@ FujiDecompressor::FujiDecompressor(RawImage img, ByteStream input_)
 }
 
 void FujiDecompressor::decompress() const {
+  if (header.isLossy())
+    ThrowRDE("unsupported Fujifilm lossy compressed RAF");
+
   FujiDecompressorImpl impl(
       mRaw,
       Array1DRef<const Array1DRef<const uint8_t>>(
