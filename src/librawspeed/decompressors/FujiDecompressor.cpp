@@ -1051,9 +1051,13 @@ void fuji_compressed_block::fuji_bayer_decode_block(int cur_line) {
       [this](xt_lines c, int col, FujiGradients& grads,
              [[maybe_unused]] int row, [[maybe_unused]] int i,
              [[maybe_unused]] int comp) {
+        if (header.isLossy())
+          return fuji_decode_lossy_sample_even(c, col, grads);
         return fuji_decode_sample_even(c, col, grads.main);
       },
       [this](xt_lines c, int col, FujiGradients& grads) {
+        if (header.isLossy())
+          return fuji_decode_lossy_sample_odd(c, col, grads);
         return fuji_decode_sample_odd(c, col, grads.main);
       },
       cur_line);
@@ -1192,9 +1196,6 @@ FujiDecompressor::FujiDecompressor(RawImage img, ByteStream input_)
 
   if (mRaw->dim != iPoint2D(header.raw_width, header.raw_height))
     ThrowRDE("RAF header specifies different dimensions!");
-
-  if (header.isLossy() && header.raw_type == 0)
-    ThrowRDE("unsupported Fujifilm Bayer lossy compressed RAF");
 
   if (header.isLossless() && 12 == header.raw_bits) {
     ThrowRDE("Aha, finally, a 12-bit compressed RAF! Please consider providing "
