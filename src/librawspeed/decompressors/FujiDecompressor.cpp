@@ -71,6 +71,27 @@ struct int_pair final {
   int value2;
 };
 
+struct FujiQTable final {
+  std::vector<int8_t> q_table;
+  std::array<int, 5> q_point = {};
+
+  int q_base = 0;
+  int max_bits = 0;
+  int min_value = 0x40;
+  int raw_bits = 0;
+  int total_values = 0;
+  int maxDiff = 0;
+  int q_grad_mult = 9;
+
+  [[nodiscard]] int8_t lookup(int delta) const {
+    return q_table[maxValue() + delta];
+  }
+
+  [[nodiscard]] int maxValue() const { return q_point[4]; }
+
+  [[nodiscard]] int initialMaxDiff() const { return maxDiff; }
+};
+
 enum xt_lines : uint8_t {
   R0 = 0,
   R1,
@@ -96,16 +117,8 @@ enum xt_lines : uint8_t {
 struct fuji_compressed_params final {
   explicit fuji_compressed_params(const FujiDecompressor::FujiHeader& h);
 
-  [[nodiscard]] int8_t qTableLookup(int cur_val) const;
-
-  std::vector<int8_t> q_table; /* quantization table */
-  std::array<int, 5> q_point;  /* quantization points */
-  int max_bits;
-  int min_value;
-  int raw_bits;
-  int total_values;
-  int maxDiff;
-  uint16_t line_width;
+  FujiQTable qtable;
+  uint16_t line_width = 0;
 };
 
 struct FujiStrip final {
@@ -166,25 +179,68 @@ struct FujiStrip final {
   [[nodiscard]] int offsetX() const { return h.block_size * n; }
 };
 
-int8_t GetGradient(const fuji_compressed_params& p, int cur_val) {
-  cur_val -= p.q_point[4];
+int8_t GetGradient(const FujiQTable& qt, int cur_val) {
+  cur_val -= qt.maxValue();
 
   int abs_cur_val = std::abs(cur_val);
 
   int grad = 0;
   if (abs_cur_val > 0)
     grad = 1;
-  if (abs_cur_val >= p.q_point[1])
+  if (abs_cur_val >= qt.q_point[1])
     grad = 2;
-  if (abs_cur_val >= p.q_point[2])
+  if (abs_cur_val >= qt.q_point[2])
     grad = 3;
-  if (abs_cur_val >= p.q_point[3])
+  if (abs_cur_val >= qt.q_point[3])
     grad = 4;
 
   if (cur_val < 0)
     grad *= -1;
 
   return implicit_cast<int8_t>(grad);
+}
+
+FujiQTable makeLosslessQTable(int raw_bits) {
+  FujiQTable qt;
+
+  qt.q_point[0] = 0;
+  qt.q_point[1] = 0x12;
+  qt.q_point[2] = 0x43;
+  qt.q_point[3] = 0x114;
+  qt.q_point[4] = (1 << raw_bits) - 1;
+
+  qt.raw_bits = raw_bits;
+
+  // Populate gradients.
+  const int NumGradientTableEntries = 2 * (1 << raw_bits);
+  qt.q_table.resize(NumGradientTableEntries);
+  for (int i = 0; i != NumGradientTableEntries; ++i) {
+    qt.q_table[i] = GetGradient(qt, i);
+  }
+
+  if (qt.maxValue() == 0xFFFF) { // (1 << raw_bits) - 1
+    qt.total_values = 0x10000;   // 1 << raw_bits
+    qt.raw_bits = 16;            // raw_bits
+    qt.max_bits = 64;            // raw_bits * (64 / raw_bits)
+    qt.maxDiff = 1024;           // 1 << (raw_bits - 6)
+  } else if (qt.maxValue() == 0x3FFF) {
+    qt.total_values = 0x4000;
+    qt.raw_bits = 14;
+    qt.max_bits = 56;
+    qt.maxDiff = 256;
+  } else if (qt.maxValue() == 0xFFF) {
+    qt.total_values = 4096;
+    qt.raw_bits = 12;
+    qt.max_bits = 48; // out-of-family, there's greater pattern at play.
+    qt.maxDiff = 64;
+
+    ThrowRDE("Aha, finally, a 12-bit compressed RAF! Please consider providing "
+             "samples on <https://raw.pixls.us/>, thanks!");
+  } else {
+    ThrowRDE("FUJI q_point");
+  }
+
+  return qt;
 }
 
 fuji_compressed_params::fuji_compressed_params(
@@ -200,45 +256,7 @@ fuji_compressed_params::fuji_compressed_params(
     line_width = h.block_size >> 1;
   }
 
-  q_point[0] = 0;
-  q_point[1] = 0x12;
-  q_point[2] = 0x43;
-  q_point[3] = 0x114;
-  q_point[4] = (1 << h.raw_bits) - 1;
-  min_value = 0x40;
-
-  // populting gradients
-  const int NumGradientTableEntries = 2 * (1 << h.raw_bits);
-  q_table.resize(NumGradientTableEntries);
-  for (int i = 0; i != NumGradientTableEntries; ++i) {
-    q_table[i] = GetGradient(*this, i);
-  }
-
-  if (q_point[4] == 0xFFFF) { // (1 << h.raw_bits) - 1
-    total_values = 0x10000;   // 1 << h.raw_bits
-    raw_bits = 16;            // h.raw_bits
-    max_bits = 64;            // h.raw_bits * (64 / h.raw_bits)
-    maxDiff = 1024;           // 1 << (h.raw_bits - 6)
-  } else if (q_point[4] == 0x3FFF) {
-    total_values = 0x4000;
-    raw_bits = 14;
-    max_bits = 56;
-    maxDiff = 256;
-  } else if (q_point[4] == 0xFFF) {
-    total_values = 4096;
-    raw_bits = 12;
-    max_bits = 48; // out-of-family, there's greater pattern at play.
-    maxDiff = 64;
-
-    ThrowRDE("Aha, finally, a 12-bit compressed RAF! Please consider providing "
-             "samples on <https://raw.pixls.us/>, thanks!");
-  } else {
-    ThrowRDE("FUJI q_point");
-  }
-}
-
-int8_t fuji_compressed_params::qTableLookup(int cur_val) const {
-  return q_table[cur_val];
+  qtable = makeLosslessQTable(h.raw_bits);
 }
 
 struct fuji_compressed_block final {
@@ -327,9 +345,9 @@ void fuji_compressed_block::reset() {
 
   for (int j = 0; j < 3; j++) {
     for (int i = 0; i < 41; i++) {
-      grad_even[j][i].value1 = common_info.maxDiff;
+      grad_even[j][i].value1 = common_info.qtable.initialMaxDiff();
       grad_even[j][i].value2 = 1;
-      grad_odd[j][i].value1 = common_info.maxDiff;
+      grad_odd[j][i].value1 = common_info.qtable.initialMaxDiff();
       grad_odd[j][i].value2 = 1;
     }
   }
@@ -448,14 +466,15 @@ fuji_compressed_block::fuji_decode_sample(int grad, int interp_val,
   int gradient = std::abs(grad);
 
   int sampleBits = fuji_zerobits(*pump);
+  const auto& qtable = common_info.qtable;
 
   int codeBits;
   int codeDelta;
-  if (sampleBits < common_info.max_bits - common_info.raw_bits - 1) {
+  if (sampleBits < qtable.max_bits - qtable.raw_bits - 1) {
     codeBits = bitDiff(grads[gradient].value1, grads[gradient].value2);
     codeDelta = sampleBits << codeBits;
   } else {
-    codeBits = common_info.raw_bits;
+    codeBits = qtable.raw_bits;
     codeDelta = 1;
   }
 
@@ -465,7 +484,7 @@ fuji_compressed_block::fuji_decode_sample(int grad, int interp_val,
     code = pump->getBitsNoFill(codeBits);
   code += codeDelta;
 
-  if (code < 0 || code >= common_info.total_values) {
+  if (code < 0 || code >= qtable.total_values) {
     ThrowRDE("fuji_decode_sample");
   }
 
@@ -477,7 +496,7 @@ fuji_compressed_block::fuji_decode_sample(int grad, int interp_val,
 
   grads[gradient].value1 += std::abs(code);
 
-  if (grads[gradient].value2 == common_info.min_value) {
+  if (grads[gradient].value2 == qtable.min_value) {
     grads[gradient].value1 >>= 1;
     grads[gradient].value2 >>= 1;
   }
@@ -491,22 +510,21 @@ fuji_compressed_block::fuji_decode_sample(int grad, int interp_val,
   }
 
   if (interp_val < 0) {
-    interp_val += common_info.total_values;
-  } else if (interp_val > common_info.q_point[4]) {
-    interp_val -= common_info.total_values;
+    interp_val += qtable.total_values;
+  } else if (interp_val > qtable.maxValue()) {
+    interp_val -= qtable.total_values;
   }
 
   if (interp_val < 0)
     return 0;
 
-  return std::min(interp_val, common_info.q_point[4]);
+  return std::min(interp_val, qtable.maxValue());
 }
 
 __attribute__((always_inline)) inline int
 fuji_compressed_block::fuji_quant_gradient(int v1, int v2) const {
-  const auto& ci = common_info;
-  return (9 * ci.qTableLookup(ci.q_point[4] + v1)) +
-         ci.qTableLookup(ci.q_point[4] + v2);
+  const auto& qtable = common_info.qtable;
+  return (qtable.q_grad_mult * qtable.lookup(v1)) + qtable.lookup(v2);
 }
 
 __attribute__((always_inline)) inline std::pair<int, int>
