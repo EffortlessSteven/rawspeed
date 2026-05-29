@@ -45,6 +45,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <bitset>
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
@@ -81,6 +82,7 @@ struct FujiQTable final {
   int raw_bits = 0;
   int total_values = 0;
   int maxDiff = 0;
+  int max_grad = 0;
   int q_grad_mult = 9;
 
   [[nodiscard]] int8_t lookup(int delta) const {
@@ -114,10 +116,82 @@ enum xt_lines : uint8_t {
   ltotal
 };
 
+struct FujiGradients final {
+  std::array<int_pair, 41> main;
+  std::array<std::array<int_pair, 5>, 3> lossyStatic;
+};
+
+int RAWSPEED_READNONE fujiLog2Ceil(int value) {
+  invariant(value > 0);
+  return implicit_cast<int>(std::bit_width(static_cast<unsigned>(value - 1)));
+}
+
+int RAWSPEED_READNONE maxValueForRawBits(int raw_bits) {
+  invariant(raw_bits > 0);
+  return (1 << raw_bits) - 1;
+}
+
+void populateQTable(FujiQTable& qt) {
+  const int maxValue = qt.maxValue();
+  qt.q_table.resize(2 * (maxValue + 1));
+
+  for (int delta = -maxValue; delta <= maxValue; ++delta) {
+    int8_t grad;
+    if (delta <= -qt.q_point[3])
+      grad = -4;
+    else if (delta <= -qt.q_point[2])
+      grad = -3;
+    else if (delta <= -qt.q_point[1])
+      grad = -2;
+    else if (delta < -qt.q_point[0])
+      grad = -1;
+    else if (delta <= qt.q_point[0])
+      grad = 0;
+    else if (delta < qt.q_point[1])
+      grad = 1;
+    else if (delta < qt.q_point[2])
+      grad = 2;
+    else if (delta < qt.q_point[3])
+      grad = 3;
+    else
+      grad = 4;
+
+    qt.q_table[maxValue + delta] = grad;
+  }
+}
+
 struct fuji_compressed_params final {
-  explicit fuji_compressed_params(const FujiDecompressor::FujiHeader& h);
+  explicit fuji_compressed_params(
+      const FujiDecompressor::FujiHeader& h,
+      Optional<Array1DRef<const Array1DRef<const uint8_t>>> qbaseStrips);
 
   FujiQTable qtable;
+  struct FujiLossyQTableCache final {
+    std::bitset<256> observed_qbases;
+    std::array<int, 256> lossy_main_qtable_indices = {};
+    std::vector<FujiQTable> lossy_main_qtables;
+    std::array<FujiQTable, 3> lossy_static_qtables;
+
+    FujiLossyQTableCache() { lossy_main_qtable_indices.fill(-1); }
+
+    void init(const FujiDecompressor::FujiHeader& h,
+              Array1DRef<const Array1DRef<const uint8_t>> qbaseStrips);
+
+    [[nodiscard]] const FujiQTable& mainLossyQTable(uint8_t qbase) const {
+      const int idx = lossy_main_qtable_indices[qbase];
+      invariant(idx >= 0);
+      invariant(idx < implicit_cast<int>(lossy_main_qtables.size()));
+      return lossy_main_qtables[idx];
+    }
+
+    [[nodiscard]] const FujiQTable& staticLossyQTable(int idx) const {
+      invariant(idx >= 0 &&
+                idx < implicit_cast<int>(lossy_static_qtables.size()));
+      return lossy_static_qtables[idx];
+    }
+  };
+
+  FujiLossyQTableCache lossy_qtables;
   uint16_t line_width = 0;
 };
 
@@ -179,27 +253,6 @@ struct FujiStrip final {
   [[nodiscard]] int offsetX() const { return h.block_size * n; }
 };
 
-int8_t GetGradient(const FujiQTable& qt, int cur_val) {
-  cur_val -= qt.maxValue();
-
-  int abs_cur_val = std::abs(cur_val);
-
-  int grad = 0;
-  if (abs_cur_val > 0)
-    grad = 1;
-  if (abs_cur_val >= qt.q_point[1])
-    grad = 2;
-  if (abs_cur_val >= qt.q_point[2])
-    grad = 3;
-  if (abs_cur_val >= qt.q_point[3])
-    grad = 4;
-
-  if (cur_val < 0)
-    grad *= -1;
-
-  return implicit_cast<int8_t>(grad);
-}
-
 FujiQTable makeLosslessQTable(int raw_bits) {
   FujiQTable qt;
 
@@ -207,16 +260,11 @@ FujiQTable makeLosslessQTable(int raw_bits) {
   qt.q_point[1] = 0x12;
   qt.q_point[2] = 0x43;
   qt.q_point[3] = 0x114;
-  qt.q_point[4] = (1 << raw_bits) - 1;
+  qt.q_point[4] = maxValueForRawBits(raw_bits);
 
   qt.raw_bits = raw_bits;
 
-  // Populate gradients.
-  const int NumGradientTableEntries = 2 * (1 << raw_bits);
-  qt.q_table.resize(NumGradientTableEntries);
-  for (int i = 0; i != NumGradientTableEntries; ++i) {
-    qt.q_table[i] = GetGradient(qt, i);
-  }
+  populateQTable(qt);
 
   if (qt.maxValue() == 0xFFFF) { // (1 << raw_bits) - 1
     qt.total_values = 0x10000;   // 1 << raw_bits
@@ -243,8 +291,117 @@ FujiQTable makeLosslessQTable(int raw_bits) {
   return qt;
 }
 
+FujiQTable makeLossyMainQTable(int raw_bits, uint8_t qbase) {
+  FujiQTable qt;
+
+  const int qbaseInt = qbase;
+  const int maxValue = maxValueForRawBits(raw_bits);
+  const int maxValuePlusOne = maxValue + 1;
+
+  qt.q_point[0] = qbaseInt;
+  qt.q_point[1] = (3 * qbaseInt) + 0x12;
+  qt.q_point[2] = (5 * qbaseInt) + 0x43;
+  qt.q_point[3] = (7 * qbaseInt) + 0x114;
+  qt.q_point[4] = maxValue;
+
+  if (qt.q_point[1] >= maxValuePlusOne || qt.q_point[1] < qbaseInt + 1)
+    qt.q_point[1] = qbaseInt + 1;
+  if (qt.q_point[2] < qt.q_point[1] || qt.q_point[2] >= maxValuePlusOne)
+    qt.q_point[2] = qt.q_point[1];
+  if (qt.q_point[3] < qt.q_point[2] || qt.q_point[3] >= maxValuePlusOne)
+    qt.q_point[3] = qt.q_point[2];
+
+  qt.q_base = qbaseInt;
+  qt.total_values = (maxValue + (2 * qbaseInt)) / ((2 * qbaseInt) + 1) + 1;
+  qt.raw_bits = fujiLog2Ceil(qt.total_values);
+  qt.max_bits = 4 * fujiLog2Ceil(maxValuePlusOne);
+  qt.maxDiff = std::max(2, (qt.total_values + 0x20) >> 6);
+  qt.q_grad_mult = 9;
+
+  populateQTable(qt);
+  return qt;
+}
+
+FujiQTable makeLossyStaticQTable(int raw_bits, int idx) {
+  FujiQTable qt;
+
+  const int maxValue = maxValueForRawBits(raw_bits);
+
+  qt.q_point[4] = maxValue;
+  qt.q_base = idx;
+  qt.max_grad = 5 + idx;
+  qt.q_grad_mult = 3;
+  qt.max_bits = 4 * fujiLog2Ceil(maxValue + 1);
+
+  switch (idx) {
+  case 0:
+    qt.q_point[0] = 0;
+    qt.q_point[1] = maxValue >= 0x12 ? 0x12 : qt.q_point[0] + 1;
+    qt.q_point[2] = maxValue >= 0x43 ? 0x43 : qt.q_point[1];
+    qt.q_point[3] = maxValue >= 0x114 ? 0x114 : qt.q_point[2];
+    qt.total_values = maxValue + 1;
+    break;
+  case 1:
+    qt.q_point[0] = 1;
+    qt.q_point[1] = maxValue >= 0x15 ? 0x15 : qt.q_point[0] + 1;
+    qt.q_point[2] = maxValue >= 0x48 ? 0x48 : qt.q_point[1];
+    qt.q_point[3] = maxValue >= 0x11B ? 0x11B : qt.q_point[2];
+    qt.total_values = (maxValue + 2) / 3 + 1;
+    break;
+  case 2:
+    qt.q_point[0] = 2;
+    qt.q_point[1] = maxValue >= 0x18 ? 0x18 : qt.q_point[0] + 1;
+    qt.q_point[2] = maxValue >= 0x4D ? 0x4D : qt.q_point[1];
+    qt.q_point[3] = maxValue >= 0x122 ? 0x122 : qt.q_point[2];
+    qt.total_values = (maxValue + 4) / 5 + 1;
+    break;
+  default:
+    __builtin_unreachable();
+  }
+
+  qt.raw_bits = fujiLog2Ceil(qt.total_values);
+  qt.maxDiff = std::max(2, (qt.total_values + 0x20) >> 6);
+
+  populateQTable(qt);
+  return qt;
+}
+
+std::array<FujiQTable, 3> makeLossyStaticQTables(int raw_bits) {
+  return {makeLossyStaticQTable(raw_bits, 0),
+          makeLossyStaticQTable(raw_bits, 1),
+          makeLossyStaticQTable(raw_bits, 2)};
+}
+
+void fuji_compressed_params::FujiLossyQTableCache::init(
+    const FujiDecompressor::FujiHeader& h,
+    Array1DRef<const Array1DRef<const uint8_t>> qbaseStrips) {
+  invariant(h.isLossy());
+  invariant(qbaseStrips.size() == h.blocks_in_row);
+
+  for (int strip = 0; strip != qbaseStrips.size(); ++strip) {
+    const auto qbases = qbaseStrips(strip);
+    invariant(qbases.size() == h.total_lines);
+    for (int line = 0; line != qbases.size(); ++line)
+      observed_qbases.set(qbases(line));
+  }
+
+  lossy_static_qtables = makeLossyStaticQTables(h.raw_bits);
+  lossy_main_qtables.reserve(observed_qbases.count());
+
+  for (int qbase = 0; qbase != 256; ++qbase) {
+    if (!observed_qbases[qbase])
+      continue;
+
+    lossy_main_qtable_indices[qbase] =
+        implicit_cast<int>(lossy_main_qtables.size());
+    lossy_main_qtables.emplace_back(
+        makeLossyMainQTable(h.raw_bits, implicit_cast<uint8_t>(qbase)));
+  }
+}
+
 fuji_compressed_params::fuji_compressed_params(
-    const FujiDecompressor::FujiHeader& h) {
+    const FujiDecompressor::FujiHeader& h,
+    Optional<Array1DRef<const Array1DRef<const uint8_t>>> qbaseStrips) {
   if ((h.block_size % 3 && h.raw_type == 16) ||
       (h.block_size & 1 && h.raw_type == 0)) {
     ThrowRDE("fuji_block_checks");
@@ -256,7 +413,13 @@ fuji_compressed_params::fuji_compressed_params(
     line_width = h.block_size >> 1;
   }
 
-  qtable = makeLosslessQTable(h.raw_bits);
+  if (h.isLossless()) {
+    qtable = makeLosslessQTable(h.raw_bits);
+  } else {
+    if (!qbaseStrips)
+      ThrowRDE("Fujifilm lossy RAF q_base value missing");
+    lossy_qtables.init(h, *qbaseStrips);
+  }
 }
 
 struct fuji_compressed_block final {
@@ -273,8 +436,8 @@ struct fuji_compressed_block final {
   Optional<BitStreamerMSB> pump;
 
   // tables of gradients
-  std::array<std::array<int_pair, 41>, 3> grad_even;
-  std::array<std::array<int_pair, 41>, 3> grad_odd;
+  std::array<FujiGradients, 3> grad_even;
+  std::array<FujiGradients, 3> grad_odd;
 
   std::vector<uint16_t> linealloc;
   Array2DRef<uint16_t> lines;
@@ -343,12 +506,29 @@ void fuji_compressed_block::reset() {
   for (xt_lines color : {R2, G2, B2})
     lines(color, lines.width() - 1) = lines(color - 1, lines.width() - 2);
 
-  for (int j = 0; j < 3; j++) {
-    for (int i = 0; i < 41; i++) {
-      grad_even[j][i].value1 = common_info.qtable.initialMaxDiff();
-      grad_even[j][i].value2 = 1;
-      grad_odd[j][i].value1 = common_info.qtable.initialMaxDiff();
-      grad_odd[j][i].value2 = 1;
+  if (header.isLossless()) {
+    for (int j = 0; j < 3; j++) {
+      for (int i = 0; i < 41; i++) {
+        grad_even[j].main[i].value1 = common_info.qtable.initialMaxDiff();
+        grad_even[j].main[i].value2 = 1;
+        grad_odd[j].main[i].value1 = common_info.qtable.initialMaxDiff();
+        grad_odd[j].main[i].value2 = 1;
+      }
+    }
+  }
+
+  if (header.isLossy()) {
+    for (int table = 0; table != 3; ++table) {
+      const FujiQTable& qtable =
+          common_info.lossy_qtables.staticLossyQTable(table);
+      for (int j = 0; j < 3; ++j) {
+        for (int i = 0; i < 5; ++i) {
+          grad_even[j].lossyStatic[table][i].value1 = qtable.initialMaxDiff();
+          grad_even[j].lossyStatic[table][i].value2 = 1;
+          grad_odd[j].lossyStatic[table][i].value1 = qtable.initialMaxDiff();
+          grad_odd[j].lossyStatic[table][i].value2 = 1;
+        }
+      }
     }
   }
 }
@@ -642,7 +822,8 @@ fuji_compressed_block::fuji_decode_block(T func_even,
       if (i < line_width) {
         for (int comp = 0; comp != 2; comp++) {
           int& col = pos[comp].even;
-          int sample = func_even(c[comp], col, grad_even[grad], row, i, comp);
+          int sample =
+              func_even(c[comp], col, grad_even[grad].main, row, i, comp);
           lines(c[comp], 1 + (2 * col) + 0) = implicit_cast<uint16_t>(sample);
           ++col;
         }
@@ -651,7 +832,8 @@ fuji_compressed_block::fuji_decode_block(T func_even,
       if (i >= 4) {
         for (int comp = 0; comp != 2; comp++) {
           int& col = pos[comp].odd;
-          int sample = fuji_decode_sample_odd(c[comp], col, grad_odd[grad]);
+          int sample =
+              fuji_decode_sample_odd(c[comp], col, grad_odd[grad].main);
           lines(c[comp], 1 + (2 * col) + 1) = implicit_cast<uint16_t>(sample);
           ++col;
         }
@@ -808,18 +990,20 @@ class FujiDecompressorImpl final {
   void decompressThread() const noexcept;
 
 public:
-  FujiDecompressorImpl(RawImage mRaw,
-                       Array1DRef<const Array1DRef<const uint8_t>> strips,
-                       const FujiDecompressor::FujiHeader& h);
+  FujiDecompressorImpl(
+      RawImage mRaw, Array1DRef<const Array1DRef<const uint8_t>> strips,
+      Optional<Array1DRef<const Array1DRef<const uint8_t>>> qbaseStrips,
+      const FujiDecompressor::FujiHeader& h);
 
   void decompress();
 };
 
 FujiDecompressorImpl::FujiDecompressorImpl(
     RawImage mRaw_, Array1DRef<const Array1DRef<const uint8_t>> strips_,
+    Optional<Array1DRef<const Array1DRef<const uint8_t>>> qbaseStrips,
     const FujiDecompressor::FujiHeader& h_)
-    : mRaw(std::move(mRaw_)), strips(strips_), header(h_), common_info(header) {
-}
+    : mRaw(std::move(mRaw_)), strips(strips_), header(h_),
+      common_info(header, qbaseStrips) {}
 
 void FujiDecompressorImpl::decompressThread() const noexcept {
   fuji_compressed_block block_info(mRaw->getU16DataAsUncroppedArray2DRef(),
@@ -934,14 +1118,22 @@ FujiDecompressor::FujiDecompressor(RawImage img, ByteStream input_)
 }
 
 void FujiDecompressor::decompress() const {
-  if (header.isLossy())
-    ThrowRDE("unsupported Fujifilm lossy compressed RAF");
+  Optional<Array1DRef<const Array1DRef<const uint8_t>>> qbaseStripRefs;
+  if (header.isLossy()) {
+    invariant(qbaseStrips.size() == strips.size());
+    qbaseStripRefs = Array1DRef<const Array1DRef<const uint8_t>>(
+        qbaseStrips.data(), implicit_cast<int>(qbaseStrips.size()));
+  }
 
   FujiDecompressorImpl impl(
       mRaw,
       Array1DRef<const Array1DRef<const uint8_t>>(
           strips.data(), implicit_cast<Buffer::size_type>(strips.size())),
-      header);
+      qbaseStripRefs, header);
+
+  if (header.isLossy())
+    ThrowRDE("unsupported Fujifilm lossy compressed RAF");
+
   impl.decompress();
 }
 
